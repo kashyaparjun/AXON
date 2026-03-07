@@ -627,7 +627,6 @@ pub fn read_header(path: &Path) -> Result<Header> {
 
 pub fn read_root_manifest(path: &Path) -> Result<RootManifest> {
     let header = read_header(path)?;
-    replay_wal_scaffold(path, &header)?;
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(header.root_manifest_offset))?;
     let mut bytes = vec![0u8; header.root_manifest_size as usize];
@@ -710,16 +709,6 @@ fn read_wal_entries(path: &Path, header: &Header) -> Result<Vec<WalEntry>> {
     let mut bytes = vec![0u8; size];
     file.read_exact(&mut bytes)?;
     decode_wal(&bytes)
-}
-
-fn replay_wal_scaffold(path: &Path, header: &Header) -> Result<()> {
-    let entries = read_wal_entries(path, header)?;
-    if entries.is_empty() {
-        return Ok(());
-    }
-    let mut files = Vec::new();
-    apply_wal_entries(&mut files, &entries)?;
-    Ok(())
 }
 
 fn apply_wal_entries(files: &mut Vec<FileEntry>, entries: &[WalEntry]) -> Result<()> {
@@ -1456,7 +1445,7 @@ mod tests {
         let root = read_root_manifest(&archive_path).expect("root");
         assert_eq!(root.total_file_count, 10);
         assert!(root.format_flags & FLAG_SHARDED_LAYOUT != 0);
-        assert!(root.shard_descriptors.len() >= 1);
+        assert!(!root.shard_descriptors.is_empty());
         assert!(root.files.is_empty());
 
         let bytes = read_file(&archive_path, "docs/file-7.txt").expect("read shard file");
@@ -1570,6 +1559,45 @@ mod tests {
 
         std::fs::remove_file(archive_path).expect("cleanup");
         std::fs::remove_file(source).expect("cleanup");
+    }
+
+    #[test]
+    fn read_root_manifest_accepts_patch_only_wal_history() {
+        let archive_path = test_path("axon-test-root-manifest-patch-only-wal", "axon");
+        let source_v1 = test_path("axon-source", "txt");
+        let source_v2 = test_path("axon-source", "txt");
+        init_empty_archive(&archive_path, false).expect("init should succeed");
+        std::fs::write(&source_v1, b"v1").expect("write source");
+        std::fs::write(&source_v2, b"v2").expect("write source");
+        add_file(&archive_path, "docs/a.txt", &source_v1).expect("add");
+        patch_file(&archive_path, "docs/a.txt", &source_v2).expect("patch");
+
+        let header = read_header(&archive_path).expect("header");
+        let wal_entries = read_wal_entries(&archive_path, &header).expect("wal");
+        let patch_only = vec![wal_entries[1].clone()];
+        let wal_bytes = encode_wal(&patch_only).expect("encode wal");
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&archive_path)
+            .expect("open archive");
+        let wal_offset = file.seek(SeekFrom::End(0)).expect("seek end");
+        file.write_all(&wal_bytes).expect("write wal");
+        file.flush().expect("flush wal");
+
+        rewrite_header(&archive_path, |current| {
+            current.wal_offset = wal_offset;
+            current.wal_size = wal_bytes.len() as u64;
+        });
+
+        let root = read_root_manifest(&archive_path).expect("read root manifest");
+        assert_eq!(root.total_file_count, 1);
+        assert_eq!(root.files[0].path, "docs/a.txt");
+
+        std::fs::remove_file(archive_path).expect("cleanup");
+        std::fs::remove_file(source_v1).expect("cleanup");
+        std::fs::remove_file(source_v2).expect("cleanup");
     }
 
     #[test]

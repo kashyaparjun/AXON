@@ -15,7 +15,11 @@ Implemented in this baseline:
 - File remove tombstones in manifest (`axon remove`)
 - Manifest-only path search (`axon search`)
 - Manifest file listing with prefix/pagination (`axon list`)
-- Unit tests for header validity and archive bootstrap
+- WAL persistence + status inspection (`axon wal --status`)
+- Atomic batch mutations with OCC checks (`axon batch`)
+- Structural archive verification prechecks (`axon verify`)
+- GC checkpoint compaction scaffold (`axon gc`)
+- Unit and CLI integration tests
 
 ## Quick Start
 
@@ -54,9 +58,9 @@ bash ./run_cli_tests.sh
 - `batch` applies multiple mutations atomically with OCC expected-version checks.
 - `verify` performs pointer-bounds and decode prechecks for header/WAL/index/manifest regions.
 - `gc` checkpoints current reachable data into a fresh snapshot and folds WAL entries.
-- WAL, OCC, locks, deltas, and encryption are not implemented yet.
+- WAL and OCC are implemented for current single-writer semantics.
+- Lock-table coordination, deltas, and encryption are not implemented yet.
 - Current write path is append-only with snapshot updates for block index + root manifest, followed by header update.
-- Manifest tracks per-file `version` and `history_block_ids` for patch history.
 - Manifest tracks per-file `version`, `history_block_ids`, and `tombstoned` state.
 - `patch` and `remove` support optional `--expected-version` precondition checks.
 - Block IDs use BLAKE3 for content hashing and deduplication.
