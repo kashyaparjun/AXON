@@ -1,7 +1,7 @@
 # AXON Whitepaper
 
 Version: 0.1 Draft  
-Repository: `/Users/arjun/Documents/Axon`  
+Repository: `https://github.com/kashyaparjun/AXON`  
 Date: March 8, 2026
 
 ## Abstract
