@@ -1,7 +1,8 @@
 use axon::archive::{
     add_file, apply_batch_mutations, gc_checkpoint, init_empty_archive, list_files,
-    patch_file_with_expected_version, read_archive_info, read_file, read_root_manifest,
-    remove_file_with_expected_version, search_files, verify_archive, wal_status, BatchMutation,
+    patch_file_with_expected_version, read_archive_info, read_file, read_file_history,
+    read_file_version, read_root_manifest, remove_file_with_expected_version, search_files,
+    verify_archive, wal_status, BatchMutation,
 };
 use axon::AxonError;
 use clap::{Parser, Subcommand};
@@ -112,8 +113,17 @@ enum Command {
     Read {
         archive: PathBuf,
         file: String,
+        #[arg(long)]
+        version: Option<u32>,
         #[arg(short = 'o', long)]
         output: Option<PathBuf>,
+    },
+    /// Show per-file version history metadata.
+    Log {
+        archive: PathBuf,
+        file: String,
+        #[arg(long, default_value_t = false)]
+        pretty: bool,
     },
 }
 
@@ -210,9 +220,13 @@ fn run() -> axon::Result<()> {
         Command::Read {
             archive,
             file,
+            version,
             output,
         } => {
-            let bytes = read_file(&archive, &file)?;
+            let bytes = match version {
+                Some(value) => read_file_version(&archive, &file, value)?,
+                None => read_file(&archive, &file)?,
+            };
             if let Some(dest) = output {
                 std::fs::write(&dest, &bytes)?;
                 println!(
@@ -221,6 +235,7 @@ fn run() -> axon::Result<()> {
                         "ok": true,
                         "archive": archive,
                         "file": file,
+                        "version": version,
                         "output": dest,
                         "bytes": bytes.len()
                     })
@@ -229,6 +244,19 @@ fn run() -> axon::Result<()> {
                 let mut stdout = std::io::stdout();
                 stdout.write_all(&bytes)?;
             }
+        }
+        Command::Log {
+            archive,
+            file,
+            pretty,
+        } => {
+            let report = read_file_history(&archive, &file)?;
+            let output = if pretty {
+                serde_json::to_string_pretty(&report)?
+            } else {
+                serde_json::to_string(&report)?
+            };
+            println!("{output}");
         }
         Command::Search {
             archive,

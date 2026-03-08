@@ -1,5 +1,7 @@
 # AXON (Implementation Foundation)
 
+AXON = Agent eXchange Object Notation.
+
 This repository now contains a runnable Rust foundation for the AXON v0.1 draft format.
 
 Execution plan: see [PROJECT_PLAN.md](./PROJECT_PLAN.md).
@@ -12,6 +14,7 @@ Implemented in this baseline:
 - Header inspection (`axon info`)
 - Root manifest read (`axon peek`)
 - File add/read/patch flow with BASE blocks + block index (`axon add`, `axon read`, `axon patch`)
+- Versioned file reads (`axon read --version`)
 - File remove tombstones in manifest (`axon remove`)
 - Manifest-only path search (`axon search`)
 - Manifest file listing with prefix/pagination (`axon list`)
@@ -19,6 +22,7 @@ Implemented in this baseline:
 - Atomic batch mutations with OCC checks (`axon batch`)
 - Structural archive verification prechecks (`axon verify`)
 - GC checkpoint compaction scaffold (`axon gc`)
+- Per-file version history inspection (`axon log`)
 - Unit and CLI integration tests
 
 ## Quick Start
@@ -31,6 +35,8 @@ cargo run -- patch demo.axon src/main.rs ./src/main.rs --expected-version 2
 cargo run -- remove demo.axon src/main.rs
 cargo run -- remove demo.axon src/main.rs --expected-version 3
 cargo run -- read demo.axon src/main.rs
+cargo run -- read demo.axon src/main.rs --version 2
+cargo run -- log demo.axon src/main.rs --pretty
 cargo run -- search demo.axon src/
 cargo run -- list demo.axon --prefix src/ --limit 20
 cargo run -- wal demo.axon --status --pretty
@@ -59,7 +65,9 @@ bash ./run_cli_tests.sh
 - `verify` performs pointer-bounds and decode prechecks for header/WAL/index/manifest regions.
 - `gc` checkpoints current reachable data into a fresh snapshot and folds WAL entries.
 - WAL and OCC are implemented for current single-writer semantics.
-- Lock-table coordination, deltas, and encryption are not implemented yet.
+- Lock-table coordination and encryption are not implemented yet.
+- Delta blocks are implemented for patch/read flows with deterministic BASE/DELTA selection and depth caps.
+- Versioned reads and per-file history logs are implemented (`read --version`, `log`).
 - Current write path is append-only with snapshot updates for block index + root manifest, followed by header update.
 - Manifest tracks per-file `version`, `history_block_ids`, and `tombstoned` state.
 - `patch` and `remove` support optional `--expected-version` precondition checks.
@@ -69,6 +77,5 @@ bash ./run_cli_tests.sh
 ## Next Implementation Milestones
 
 1. Add lock-table backed multi-process writer coordination.
-2. Implement delta blocks + versioned read/log flows.
-3. Expand integrity verification beyond pointer/decode prechecks to deep consistency scans.
-4. Implement production-safe compaction/orphan reclamation.
+2. Expand integrity verification beyond pointer/decode prechecks to deep consistency scans.
+3. Implement production-safe compaction/orphan reclamation.

@@ -1,4 +1,6 @@
-use crate::format::block::{StoredBlock, ALGO_NONE, BLOCK_HEADER_SIZE};
+use crate::format::block::{
+    apply_delta, StoredBlock, ALGO_NONE, BLOCK_HEADER_SIZE, BLOCK_TYPE_BASE, BLOCK_TYPE_DELTA,
+};
 use crate::format::header::{Header, HEADER_SIZE};
 use crate::format::index::{find_block, BlockIndexEntry, BLOCK_INDEX_ENTRY_SIZE};
 use crate::format::manifest::{
@@ -15,6 +17,8 @@ use std::path::{Path, PathBuf};
 
 const SHARD_BUCKET_COUNT: u32 = 16;
 const SHARD_SPLIT_MIN_FILES: usize = 8;
+const MAX_DELTA_DEPTH: u8 = 8;
+const MAX_RECONSTRUCT_DEPTH: usize = 64;
 
 #[derive(Debug, Serialize)]
 pub struct ArchiveInfo {
@@ -54,6 +58,21 @@ pub struct GcReport {
     pub new_size: u64,
     pub blocks_copied: usize,
     pub wal_entries_compacted: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FileHistory {
+    pub path: String,
+    pub current_version: u32,
+    pub tombstoned: bool,
+    pub versions: Vec<FileVersionRecord>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FileVersionRecord {
+    pub version: u32,
+    pub block_id_hex: String,
+    pub tombstoned: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -174,16 +193,13 @@ pub fn patch_file_with_expected_version(
     let mut index = read_block_index(archive_path, &header)?;
 
     let raw = std::fs::read(source)?;
-    let new_block = StoredBlock::from_raw_base(&raw)?;
-    if new_block.header.algo != ALGO_NONE {
-        return Err(AxonError::Unsupported("only ALGO_NONE is implemented"));
-    }
 
     let file_entry = files
         .iter_mut()
         .find(|entry| entry.path == archive_file_path && !entry.tombstoned)
         .ok_or_else(|| AxonError::NotFound(archive_file_path.to_string()))?;
     ensure_expected_version(file_entry, archive_file_path, expected_version)?;
+    let new_block = select_patch_block(archive_path, &index, file_entry, &raw)?;
 
     let mut file = OpenOptions::new()
         .read(true)
@@ -286,21 +302,59 @@ pub fn read_file(archive_path: &Path, archive_file_path: &str) -> Result<Vec<u8>
         .find(|entry| entry.path == archive_file_path && !entry.tombstoned)
         .ok_or_else(|| AxonError::NotFound(archive_file_path.to_string()))?;
 
-    if file.algo != ALGO_NONE {
-        return Err(AxonError::Unsupported("only ALGO_NONE is implemented"));
-    }
-
     let block_id = hex_decode_32(&file.block_id_hex)?;
     let header = read_header(archive_path)?;
     let index = read_block_index(archive_path, &header)?;
-    let entry = find_block(&index, &block_id)
-        .ok_or_else(|| AxonError::NotFound(format!("block {}", file.block_id_hex)))?;
+    resolve_block_raw_by_id(archive_path, &index, &block_id, MAX_RECONSTRUCT_DEPTH)
+}
 
-    let block = read_stored_block_at(archive_path, entry.offset, entry.stored_size)?;
-    if block.header.block_id != block_id {
-        return Err(AxonError::InvalidArchive("block id mismatch"));
+pub fn read_file_version(
+    archive_path: &Path,
+    archive_file_path: &str,
+    version: u32,
+) -> Result<Vec<u8>> {
+    let files = load_manifest_files(archive_path)?;
+    let file = files
+        .iter()
+        .find(|entry| entry.path == archive_file_path)
+        .ok_or_else(|| AxonError::NotFound(archive_file_path.to_string()))?;
+
+    let (block_id_hex, tombstoned) = block_id_for_version(file, version, archive_file_path)?;
+    if tombstoned {
+        return Err(AxonError::NotFound(format!(
+            "{archive_file_path}@{version} (tombstoned)"
+        )));
     }
-    Ok(block.body)
+
+    let block_id = hex_decode_32(&block_id_hex)?;
+    let header = read_header(archive_path)?;
+    let index = read_block_index(archive_path, &header)?;
+    resolve_block_raw_by_id(archive_path, &index, &block_id, MAX_RECONSTRUCT_DEPTH)
+}
+
+pub fn read_file_history(archive_path: &Path, archive_file_path: &str) -> Result<FileHistory> {
+    let files = load_manifest_files(archive_path)?;
+    let file = files
+        .iter()
+        .find(|entry| entry.path == archive_file_path)
+        .ok_or_else(|| AxonError::NotFound(archive_file_path.to_string()))?;
+
+    let mut versions = Vec::with_capacity(file.version as usize);
+    for version in 1..=file.version {
+        let (block_id_hex, tombstoned) = block_id_for_version(file, version, archive_file_path)?;
+        versions.push(FileVersionRecord {
+            version,
+            block_id_hex,
+            tombstoned,
+        });
+    }
+
+    Ok(FileHistory {
+        path: archive_file_path.to_string(),
+        current_version: file.version,
+        tombstoned: file.tombstoned,
+        versions,
+    })
 }
 
 pub fn read_archive_info(path: &Path) -> Result<ArchiveInfo> {
@@ -446,7 +500,7 @@ pub fn apply_batch_mutations(archive_path: &Path, mutations: &[BatchMutation]) -
         },
         Patch {
             path: String,
-            block: StoredBlock,
+            raw: Vec<u8>,
             expected_version: Option<u32>,
         },
         Remove {
@@ -475,13 +529,9 @@ pub fn apply_batch_mutations(archive_path: &Path, mutations: &[BatchMutation]) -
                 expected_version,
             } => {
                 let raw = std::fs::read(source)?;
-                let block = StoredBlock::from_raw_base(&raw)?;
-                if block.header.algo != ALGO_NONE {
-                    return Err(AxonError::Unsupported("only ALGO_NONE is implemented"));
-                }
                 prepared.push(PreparedMutation::Patch {
                     path: path.clone(),
-                    block,
+                    raw,
                     expected_version: *expected_version,
                 });
             }
@@ -502,6 +552,7 @@ pub fn apply_batch_mutations(archive_path: &Path, mutations: &[BatchMutation]) -
     let root_manifest = read_root_manifest(archive_path)?;
     let mut files = load_manifest_files(archive_path)?;
     let mut index = read_block_index(archive_path, &header)?;
+    let mut blocks_to_append: Vec<StoredBlock> = Vec::new();
 
     for mutation in &prepared {
         match mutation {
@@ -530,10 +581,11 @@ pub fn apply_batch_mutations(archive_path: &Path, mutations: &[BatchMutation]) -
                     algo: block.header.algo,
                     tombstoned: false,
                 });
+                blocks_to_append.push(block.clone());
             }
             PreparedMutation::Patch {
                 path,
-                block,
+                raw,
                 expected_version,
             } => {
                 let file_entry = files
@@ -541,6 +593,7 @@ pub fn apply_batch_mutations(archive_path: &Path, mutations: &[BatchMutation]) -
                     .find(|entry| entry.path == *path && !entry.tombstoned)
                     .ok_or_else(|| AxonError::NotFound(path.clone()))?;
                 ensure_expected_version(file_entry, path, *expected_version)?;
+                let block = select_patch_block(archive_path, &index, file_entry, raw)?;
                 file_entry
                     .history_block_ids
                     .push(file_entry.block_id_hex.clone());
@@ -560,6 +613,7 @@ pub fn apply_batch_mutations(archive_path: &Path, mutations: &[BatchMutation]) -
                     algo: block.header.algo,
                     tombstoned: false,
                 });
+                blocks_to_append.push(block);
             }
             PreparedMutation::Remove {
                 path,
@@ -597,13 +651,8 @@ pub fn apply_batch_mutations(archive_path: &Path, mutations: &[BatchMutation]) -
         .write(true)
         .open(archive_path)?;
     let mut end = file.seek(SeekFrom::End(0))?;
-    for mutation in &prepared {
-        match mutation {
-            PreparedMutation::Add { block, .. } | PreparedMutation::Patch { block, .. } => {
-                append_block_if_missing(&mut file, &mut end, &mut index, block)?;
-            }
-            PreparedMutation::Remove { .. } => {}
-        }
+    for block in &blocks_to_append {
+        append_block_if_missing(&mut file, &mut end, &mut index, block)?;
     }
 
     commit_snapshots(
@@ -709,6 +758,109 @@ fn read_wal_entries(path: &Path, header: &Header) -> Result<Vec<WalEntry>> {
     let mut bytes = vec![0u8; size];
     file.read_exact(&mut bytes)?;
     decode_wal(&bytes)
+}
+
+fn select_patch_block(
+    archive_path: &Path,
+    index: &[BlockIndexEntry],
+    file_entry: &FileEntry,
+    new_raw: &[u8],
+) -> Result<StoredBlock> {
+    let base_block = StoredBlock::from_raw_base(new_raw)?;
+    let current_id = hex_decode_32(&file_entry.block_id_hex)?;
+    let current_index = match find_block(index, &current_id) {
+        Some(entry) => entry,
+        None => return Ok(base_block),
+    };
+    let current_block = read_stored_block_at(
+        archive_path,
+        current_index.offset,
+        current_index.stored_size,
+    )?;
+    if current_block.header.block_id != current_id {
+        return Err(AxonError::InvalidArchive("block id mismatch"));
+    }
+    if current_block.header.block_type != BLOCK_TYPE_BASE
+        && current_block.header.block_type != BLOCK_TYPE_DELTA
+    {
+        return Err(AxonError::Unsupported("unsupported block type"));
+    }
+    if current_block.header.depth >= MAX_DELTA_DEPTH {
+        return Ok(base_block);
+    }
+
+    let current_raw =
+        resolve_block_raw_by_id(archive_path, index, &current_id, MAX_RECONSTRUCT_DEPTH)?;
+    let delta_block = StoredBlock::from_raw_delta(
+        &current_raw,
+        current_id,
+        current_block.header.depth,
+        new_raw,
+    )?;
+    if delta_block.header.stored_size < base_block.header.stored_size {
+        Ok(delta_block)
+    } else {
+        Ok(base_block)
+    }
+}
+
+fn resolve_block_raw_by_id(
+    path: &Path,
+    index: &[BlockIndexEntry],
+    block_id: &[u8; 32],
+    remaining_depth: usize,
+) -> Result<Vec<u8>> {
+    if remaining_depth == 0 {
+        return Err(AxonError::InvalidArchive(
+            "delta reconstruction depth exceeded",
+        ));
+    }
+    let entry = find_block(index, block_id)
+        .ok_or_else(|| AxonError::NotFound(format!("block {}", hex_encode(block_id))))?;
+    let block = read_stored_block_at(path, entry.offset, entry.stored_size)?;
+    if block.header.block_id != *block_id {
+        return Err(AxonError::InvalidArchive("block id mismatch"));
+    }
+    resolve_stored_block_raw(path, index, &block, remaining_depth - 1)
+}
+
+fn resolve_stored_block_raw(
+    path: &Path,
+    index: &[BlockIndexEntry],
+    block: &StoredBlock,
+    remaining_depth: usize,
+) -> Result<Vec<u8>> {
+    if block.header.algo != ALGO_NONE {
+        return Err(AxonError::Unsupported("only ALGO_NONE is implemented"));
+    }
+    if block.header.enc_flag != 0 {
+        return Err(AxonError::Unsupported(
+            "encrypted blocks are not implemented",
+        ));
+    }
+
+    match block.header.block_type {
+        BLOCK_TYPE_BASE => {
+            if block.header.raw_size != block.header.stored_size {
+                return Err(AxonError::Unsupported(
+                    "compressed base blocks are not implemented",
+                ));
+            }
+            if block.body.len() != block.header.raw_size as usize {
+                return Err(AxonError::InvalidArchive("block body length mismatch"));
+            }
+            Ok(block.body.clone())
+        }
+        BLOCK_TYPE_DELTA => {
+            if block.header.base_id == [0; 32] {
+                return Err(AxonError::InvalidArchive("delta block missing base id"));
+            }
+            let base_raw =
+                resolve_block_raw_by_id(path, index, &block.header.base_id, remaining_depth)?;
+            apply_delta(&base_raw, &block.body, block.header.raw_size as usize)
+        }
+        _ => Err(AxonError::Unsupported("unsupported block type")),
+    }
 }
 
 fn apply_wal_entries(files: &mut Vec<FileEntry>, entries: &[WalEntry]) -> Result<()> {
@@ -925,6 +1077,30 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+fn block_id_for_version(
+    file_entry: &FileEntry,
+    version: u32,
+    archive_file_path: &str,
+) -> Result<(String, bool)> {
+    if version == 0 || version > file_entry.version {
+        return Err(AxonError::NotFound(format!(
+            "{archive_file_path}@{version}"
+        )));
+    }
+    if version == file_entry.version {
+        return Ok((file_entry.block_id_hex.clone(), file_entry.tombstoned));
+    }
+
+    let idx = (version - 1) as usize;
+    let block_id = file_entry
+        .history_block_ids
+        .get(idx)
+        .ok_or(AxonError::InvalidArchive(
+            "history missing version block id",
+        ))?;
+    Ok((block_id.clone(), false))
 }
 
 fn ensure_expected_version(
@@ -1170,6 +1346,177 @@ mod tests {
         std::fs::remove_file(archive_path).expect("cleanup");
         std::fs::remove_file(source_v1).expect("cleanup");
         std::fs::remove_file(source_v2).expect("cleanup");
+    }
+
+    #[test]
+    fn patch_prefers_delta_when_smaller() {
+        let archive_path = test_path("axon-test-patch-delta", "axon");
+        let source_v1 = test_path("axon-source", "txt");
+        let source_v2 = test_path("axon-source", "txt");
+        init_empty_archive(&archive_path, false).expect("init should succeed");
+        std::fs::write(
+            &source_v1,
+            b"The quick brown fox jumps over the lazy dog. v1 payload for delta checks.",
+        )
+        .expect("write source");
+        std::fs::write(
+            &source_v2,
+            b"The quick brown fox jumps over the lazy dog. v2 payload for delta checks.",
+        )
+        .expect("write source");
+
+        add_file(&archive_path, "docs/a.txt", &source_v1).expect("add");
+        patch_file(&archive_path, "docs/a.txt", &source_v2).expect("patch");
+
+        let manifest = read_root_manifest(&archive_path).expect("manifest");
+        let entry = manifest
+            .files
+            .iter()
+            .find(|f| f.path == "docs/a.txt")
+            .expect("entry");
+        let block_id = hex_decode_32(&entry.block_id_hex).expect("block id");
+        let header = read_header(&archive_path).expect("header");
+        let index = read_block_index(&archive_path, &header).expect("index");
+        let idx = find_block(&index, &block_id).expect("index entry");
+        let block =
+            read_stored_block_at(&archive_path, idx.offset, idx.stored_size).expect("block");
+
+        assert_eq!(block.header.block_type, BLOCK_TYPE_DELTA);
+        assert_eq!(block.header.depth, 1);
+        assert_eq!(
+            read_file(&archive_path, "docs/a.txt").expect("read"),
+            std::fs::read(&source_v2).expect("read source")
+        );
+
+        std::fs::remove_file(archive_path).expect("cleanup");
+        std::fs::remove_file(source_v1).expect("cleanup");
+        std::fs::remove_file(source_v2).expect("cleanup");
+    }
+
+    #[test]
+    fn patch_falls_back_to_base_at_delta_depth_cap() {
+        let archive_path = test_path("axon-test-patch-depth-cap", "axon");
+        init_empty_archive(&archive_path, false).expect("init should succeed");
+
+        let mut sources = Vec::new();
+        for version in 0..10 {
+            let source = test_path("axon-source", "txt");
+            let content = format!(
+                "The quick brown fox jumps over the lazy dog. version={version} payload string"
+            );
+            std::fs::write(&source, content).expect("write source");
+            sources.push(source);
+        }
+
+        add_file(&archive_path, "docs/a.txt", &sources[0]).expect("add");
+        for source in &sources[1..] {
+            patch_file(&archive_path, "docs/a.txt", source).expect("patch");
+        }
+
+        let manifest = read_root_manifest(&archive_path).expect("manifest");
+        let entry = manifest
+            .files
+            .iter()
+            .find(|f| f.path == "docs/a.txt")
+            .expect("entry");
+        let block_id = hex_decode_32(&entry.block_id_hex).expect("block id");
+        let header = read_header(&archive_path).expect("header");
+        let index = read_block_index(&archive_path, &header).expect("index");
+        let mut saw_delta = false;
+        let mut saw_max_depth_delta = false;
+        for item in &index {
+            let candidate =
+                read_stored_block_at(&archive_path, item.offset, item.stored_size).expect("block");
+            if candidate.header.block_type == BLOCK_TYPE_DELTA {
+                saw_delta = true;
+                if candidate.header.depth == MAX_DELTA_DEPTH {
+                    saw_max_depth_delta = true;
+                }
+            }
+        }
+        assert!(saw_delta);
+        assert!(saw_max_depth_delta);
+        let idx = find_block(&index, &block_id).expect("index entry");
+        let block =
+            read_stored_block_at(&archive_path, idx.offset, idx.stored_size).expect("block");
+
+        assert_eq!(block.header.depth, 0);
+        assert_eq!(block.header.block_type, BLOCK_TYPE_BASE);
+        assert_eq!(
+            read_file(&archive_path, "docs/a.txt").expect("read"),
+            std::fs::read(&sources[9]).expect("read source")
+        );
+
+        std::fs::remove_file(archive_path).expect("cleanup");
+        for source in sources {
+            std::fs::remove_file(source).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn read_file_version_resolves_history_across_patches_and_remove() {
+        let archive_path = test_path("axon-test-read-version-history", "axon");
+        let v1 = test_path("axon-source", "txt");
+        let v2 = test_path("axon-source", "txt");
+        let v3 = test_path("axon-source", "txt");
+        init_empty_archive(&archive_path, false).expect("init should succeed");
+        std::fs::write(&v1, b"v1").expect("write source");
+        std::fs::write(&v2, b"v2").expect("write source");
+        std::fs::write(&v3, b"v3").expect("write source");
+
+        add_file(&archive_path, "docs/a.txt", &v1).expect("add");
+        patch_file(&archive_path, "docs/a.txt", &v2).expect("patch");
+        patch_file(&archive_path, "docs/a.txt", &v3).expect("patch");
+        remove_file(&archive_path, "docs/a.txt").expect("remove");
+
+        assert_eq!(
+            read_file_version(&archive_path, "docs/a.txt", 1).expect("v1"),
+            b"v1".to_vec()
+        );
+        assert_eq!(
+            read_file_version(&archive_path, "docs/a.txt", 2).expect("v2"),
+            b"v2".to_vec()
+        );
+        assert_eq!(
+            read_file_version(&archive_path, "docs/a.txt", 3).expect("v3"),
+            b"v3".to_vec()
+        );
+        assert!(matches!(
+            read_file_version(&archive_path, "docs/a.txt", 4).expect_err("removed"),
+            AxonError::NotFound(_)
+        ));
+
+        std::fs::remove_file(archive_path).expect("cleanup");
+        std::fs::remove_file(v1).expect("cleanup");
+        std::fs::remove_file(v2).expect("cleanup");
+        std::fs::remove_file(v3).expect("cleanup");
+    }
+
+    #[test]
+    fn read_file_history_reports_versions_and_tombstone_state() {
+        let archive_path = test_path("axon-test-history-log", "axon");
+        let v1 = test_path("axon-source", "txt");
+        let v2 = test_path("axon-source", "txt");
+        init_empty_archive(&archive_path, false).expect("init should succeed");
+        std::fs::write(&v1, b"v1").expect("write source");
+        std::fs::write(&v2, b"v2").expect("write source");
+
+        add_file(&archive_path, "docs/a.txt", &v1).expect("add");
+        patch_file(&archive_path, "docs/a.txt", &v2).expect("patch");
+        remove_file(&archive_path, "docs/a.txt").expect("remove");
+
+        let history = read_file_history(&archive_path, "docs/a.txt").expect("history");
+        assert_eq!(history.path, "docs/a.txt");
+        assert_eq!(history.current_version, 3);
+        assert!(history.tombstoned);
+        assert_eq!(history.versions.len(), 3);
+        assert!(!history.versions[0].tombstoned);
+        assert!(!history.versions[1].tombstoned);
+        assert!(history.versions[2].tombstoned);
+
+        std::fs::remove_file(archive_path).expect("cleanup");
+        std::fs::remove_file(v1).expect("cleanup");
+        std::fs::remove_file(v2).expect("cleanup");
     }
 
     #[test]

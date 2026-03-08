@@ -1,5 +1,7 @@
 # AXON Whitepaper
 
+AXON = Agent eXchange Object Notation.
+
 Version: 0.1 Draft  
 Repository: `https://github.com/kashyaparjun/AXON`  
 Date: March 8, 2026
@@ -38,7 +40,7 @@ AXON is designed around the following priorities:
 An AXON archive is composed of:
 
 - Header: fixed-size binary metadata (version, pointer offsets/sizes, checksums, counters).
-- Data blocks: content-addressed block payloads (BASE currently implemented).
+- Data blocks: content-addressed block payloads (BASE + DELTA with bounded reconstruction depth).
 - Block index: sorted block-id to offset/size mapping for direct block resolution.
 - Root manifest: top-level file/shard metadata.
 - Shard manifests: optional partitioned file metadata segments.
@@ -52,7 +54,7 @@ flowchart LR
   H --> WAL["WAL (append log)"]
   H --> IDX["Block Index (sorted entries)"]
   RM --> SH["Shard Manifests (0..N)"]
-  IDX --> BLK["Data Blocks (BASE)"]
+  IDX --> BLK["Data Blocks (BASE/DELTA)"]
   SH --> IDX
 ```
 
@@ -155,7 +157,7 @@ sequenceDiagram
 Core commands:
 
 - `init`, `info`, `peek`
-- `add`, `read`, `patch`, `remove`
+- `add`, `read`, `patch`, `remove`, `log`
 - `search`, `list`
 - `wal --status`
 - `verify`
@@ -224,7 +226,7 @@ Current repository status includes passing Rust tests and passing CLI bash suite
 - Phase A (Storage Core): complete
 - Phase B (Manifest and Sharding): complete
 - Phase C (Mutation Semantics incl. WAL/OCC): complete for current single-writer scope
-- Phase D (Delta and Versioned Reads): pending
+- Phase D (Delta and Versioned Reads): complete
 - Phase E (Maintenance/Integrity hardening): partial scaffolding
 - Phase F (Encryption and Access Tiers): pending
 
@@ -232,7 +234,7 @@ Current repository status includes passing Rust tests and passing CLI bash suite
 flowchart LR
   A["Phase A<br/>Storage Core<br/>Complete"] --> B["Phase B<br/>Manifest+Sharding<br/>Complete"]
   B --> C["Phase C<br/>WAL/OCC<br/>Complete (single-writer scope)"]
-  C --> D["Phase D<br/>Delta+Versioned Read<br/>Pending"]
+  C --> D["Phase D<br/>Delta+Versioned Read<br/>Complete"]
   D --> E["Phase E<br/>Maintenance+Integrity Hardening<br/>Partial"]
   E --> F["Phase F<br/>Encryption<br/>Pending"]
 ```
@@ -242,10 +244,9 @@ flowchart LR
 Priority next steps:
 
 1. Lock table + multi-process writer coordination.
-2. Delta block support and versioned read/log workflows.
-3. Deep integrity verification beyond pointer/decode prechecks.
-4. Production-safe compaction and orphan reclamation.
-5. Encryption tiers (mixed plain/encrypted content in one archive).
+2. Deep integrity verification beyond pointer/decode prechecks.
+3. Production-safe compaction and orphan reclamation.
+4. Encryption tiers (mixed plain/encrypted content in one archive).
 
 ## 12. Conclusion
 

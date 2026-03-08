@@ -42,9 +42,8 @@ Implemented:
 
 Not implemented:
 - Lock table and multi-process writer locking
-- Delta encode/apply
 - Encryption
-- GC/checkpoint/compaction
+- Production-hardening for GC/checkpoint/compaction
 
 ## 3. Delivery Phases
 
@@ -100,18 +99,18 @@ Acceptance criteria:
 - Successful writes are durable via WAL before manifest/index fold-in (done for current write flow)
 - WAL replay reconstructs latest visible state after restart (done)
 
-## Phase D: Delta and Version History
+## Phase D: Delta and Version History (Completed)
 
 Scope:
-- Delta block support (COPY/INSERT stream)
-- Version history tracking per file
-- Depth cap enforcement (max chain depth 8)
-- `log` and versioned `read`
+- Delta block support (COPY/INSERT stream) (done)
+- Version history tracking per file (done)
+- Depth cap enforcement (max chain depth 8) (done)
+- `log` and versioned `read` (done)
 
 Acceptance criteria:
-- Reconstruct any version within bounded chain depth
-- Delta/Base decisions are deterministic and test-covered
-- History metadata remains consistent after repeated patches
+- Reconstruct current and prior versions through bounded delta chain depth (done)
+- Delta/Base decisions are deterministic and test-covered (done for patch path)
+- History metadata remains consistent after repeated patches (done)
 
 ## Phase E: Maintenance and Integrity
 
