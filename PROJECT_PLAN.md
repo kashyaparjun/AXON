@@ -26,6 +26,7 @@ Implemented:
 - `verify` command with deep consistency checks across manifest/WAL/index/block references
 - `gc` checkpoint compaction with reachable-block copy, orphan reclamation, and idempotence coverage
 - Lock table and multi-process writer locking with TTL renew/release semantics
+- Stable CLI JSON error contract with symbolic error codes and mapped exit codes
 - Block format + block index format primitives
 - `add`, `read`, and `patch` for current-version file content
 - `remove` tombstone semantics with append-only snapshot commits
@@ -39,11 +40,10 @@ Implemented:
 - Manifest tombstone tracking (`tombstoned`) with read/patch exclusion
 - Pre-WAL expected-version guardrails on `patch`/`remove` mutations
 - Unit tests covering header validation, add/read/patch behavior, dedupe, append growth, and patch error paths
-- Top-level bash CLI tests with runner (`run_cli_tests.sh`) validating roundtrip, patch, remove, and failure paths
+- Top-level bash CLI tests with runner (`run_cli_tests.sh`) validating roundtrip, patch, remove, verify/gc/batch, and CLI contract parity/error codes
 
 Not implemented:
 - Encryption
-- Further production-hardening for lock coordination and compaction behavior
 
 ## 3. Delivery Phases
 
@@ -112,18 +112,18 @@ Acceptance criteria:
 - Delta/Base decisions are deterministic and test-covered (done for patch path)
 - History metadata remains consistent after repeated patches (done)
 
-## Phase E: Maintenance and Integrity
+## Phase E: Maintenance and Integrity (Completed)
 
 Scope:
-- `gc` checkpoint: fold WAL into manifests/index
-- Orphan reachability analysis
-- Tombstone and optional compact rewrite
-- `verify` checksum/integrity command
+- `gc` checkpoint: fold WAL into manifests/index (done)
+- Orphan reachability analysis (done)
+- Tombstone and optional compact rewrite (done via `gc --prune-tombstones`)
+- `verify` checksum/integrity command (done with deep consistency checks)
 
 Acceptance criteria:
-- GC is safe and idempotent
-- Orphaned blocks are correctly detected/reclaimed
-- Verification catches header/index/block inconsistencies
+- GC is safe and idempotent (done for current single-writer flow)
+- Orphaned blocks are correctly detected/reclaimed (done)
+- Verification catches header/index/block inconsistencies (done)
 
 ## Phase F: Encryption and Access Tiers
 
@@ -139,7 +139,7 @@ Acceptance criteria:
 
 ## 4. Cross-Cutting Workstreams
 
-- Error model and exit codes: stable, machine-readable JSON errors.
+- Error model and exit codes: stable, machine-readable JSON errors (done for CLI runtime failures).
 - Compatibility policy: strict header/version checks with clear upgrade path.
 - Observability: operation stats in CLI output (`bytes_read`, `blocks_touched`, timings).
 - Fuzzing and robustness: parsers for header, index, WAL, and delta streams.
@@ -159,16 +159,16 @@ Minimum quality gates per phase:
 
 ## 6. Immediate Sprint (Next 1-2 Iterations, Updated)
 
-1. Define WAL entry binary format and append/replay primitives.
-   Status: done for add/patch/remove entry append.
-2. Add `wal --status` and replay-on-open scaffolding.
-   Status: done.
-3. Add optimistic concurrency commit checks over expected versions across batched mutations.
-   Status: done (`batch` applies all-or-nothing with expected-version guards).
-4. Add `verify` command prechecks for header/index/manifest pointer bounds.
-   Status: done (includes WAL/index/manifest decode validation).
-5. Start GC checkpoint scaffolding to fold WAL into manifest/index snapshots.
-   Status: done (checkpoint rewrites reachable blocks/snapshots and clears folded WAL).
+1. Implement per-file AES-256-GCM encryption path for `add`/`patch`/`read`.
+   Status: pending.
+2. Add key input support (env/flag/file) with explicit error semantics for missing/invalid keys.
+   Status: pending.
+3. Support mixed encrypted/plain archives with deterministic manifest/block metadata behavior.
+   Status: pending.
+4. Extend test suite for crypto success/failure paths (including auth-tag failure and wrong-key reads).
+   Status: pending.
+5. Expand observability outputs (`bytes_read`, `blocks_touched`, timing summaries) for read/verify/gc paths.
+   Status: pending.
 
 ## 7. Definition of Done (v0.1)
 

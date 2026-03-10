@@ -61,6 +61,12 @@ pub struct GcReport {
     pub new_size: u64,
     pub blocks_copied: usize,
     pub wal_entries_compacted: usize,
+    pub tombstones_pruned: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GcOptions {
+    pub prune_tombstones: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -508,6 +514,10 @@ pub fn verify_archive(path: &Path) -> Result<VerifyReport> {
 }
 
 pub fn gc_checkpoint(path: &Path) -> Result<GcReport> {
+    gc_checkpoint_with_options(path, GcOptions::default())
+}
+
+pub fn gc_checkpoint_with_options(path: &Path, options: GcOptions) -> Result<GcReport> {
     let writer_lock = acquire_writer_lock(path)?;
     let tmp = path.with_extension("axon.gc.tmp");
     if tmp.exists() {
@@ -518,7 +528,13 @@ pub fn gc_checkpoint(path: &Path) -> Result<GcReport> {
         let old_size = std::fs::metadata(path)?.len();
         let header = read_header(path)?;
         let root = read_root_manifest(path)?;
-        let files = load_manifest_files(path)?;
+        let mut files = load_manifest_files(path)?;
+        let tombstones_before = files.iter().filter(|entry| entry.tombstoned).count();
+        if options.prune_tombstones {
+            files.retain(|entry| !entry.tombstoned);
+        }
+        let tombstones_after = files.iter().filter(|entry| entry.tombstoned).count();
+        let tombstones_pruned = tombstones_before.saturating_sub(tombstones_after);
         let old_index = read_block_index(path, &header)?;
         let wal_entries = read_wal_entries(path, &header)?;
 
@@ -583,6 +599,7 @@ pub fn gc_checkpoint(path: &Path) -> Result<GcReport> {
             new_size,
             blocks_copied: new_index.len(),
             wal_entries_compacted: wal_entries.len(),
+            tombstones_pruned,
         })
     })();
 
@@ -2324,6 +2341,7 @@ mod tests {
         let report = gc_checkpoint(&archive_path).expect("gc");
         assert!(report.ok);
         assert!(report.wal_entries_compacted >= 2);
+        assert_eq!(report.tombstones_pruned, 0);
         assert_eq!(
             read_file(&archive_path, "docs/a.txt").expect("read"),
             b"b".to_vec()
@@ -2335,6 +2353,100 @@ mod tests {
         std::fs::remove_file(archive_path).expect("cleanup");
         std::fs::remove_file(a).expect("cleanup");
         std::fs::remove_file(b).expect("cleanup");
+    }
+
+    #[test]
+    fn gc_with_prune_tombstones_removes_tombstoned_entries() {
+        let archive_path = test_path("axon-test-gc-prune-tombstones", "axon");
+        let source = test_path("axon-source", "txt");
+        init_empty_archive(&archive_path, false).expect("init should succeed");
+        std::fs::write(&source, b"payload").expect("write source");
+        add_file(&archive_path, "docs/a.txt", &source).expect("add");
+        remove_file(&archive_path, "docs/a.txt").expect("remove");
+
+        let before = list_files(&archive_path, "", true, 0, None).expect("list before");
+        assert_eq!(before.len(), 1);
+        assert!(before[0].tombstoned);
+
+        let report = gc_checkpoint_with_options(
+            &archive_path,
+            GcOptions {
+                prune_tombstones: true,
+            },
+        )
+        .expect("gc prune");
+        assert!(report.ok);
+        assert_eq!(report.tombstones_pruned, 1);
+
+        let after = list_files(&archive_path, "", true, 0, None).expect("list after");
+        assert!(after.is_empty());
+        let err = read_file(&archive_path, "docs/a.txt").expect_err("read should fail");
+        assert!(matches!(err, AxonError::NotFound(_)));
+
+        std::fs::remove_file(archive_path).expect("cleanup");
+        std::fs::remove_file(source).expect("cleanup");
+    }
+
+    #[test]
+    fn gc_returns_conflict_when_writer_lock_is_active() {
+        let archive_path = test_path("axon-test-gc-lock-conflict", "axon");
+        let source = test_path("axon-source", "txt");
+        init_empty_archive(&archive_path, false).expect("init should succeed");
+        std::fs::write(&source, b"payload").expect("write source");
+        add_file(&archive_path, "docs/a.txt", &source).expect("add");
+
+        let now = unix_now_millis().expect("now");
+        let lock = WriterLockRecord {
+            owner_pid: 9999,
+            acquired_at_ms: now,
+            expires_at_ms: now + WRITER_LOCK_TTL.as_millis() as u64,
+        };
+        let lock_path = writer_lock_path(&archive_path);
+        std::fs::write(
+            &lock_path,
+            serde_json::to_vec(&lock).expect("serialize lock"),
+        )
+        .expect("write lock");
+
+        let err = gc_checkpoint(&archive_path).expect_err("gc should fail with lock conflict");
+        assert!(matches!(err, AxonError::Conflict(_)));
+
+        std::fs::remove_file(lock_path).expect("cleanup lock");
+        std::fs::remove_file(archive_path).expect("cleanup");
+        std::fs::remove_file(source).expect("cleanup");
+    }
+
+    #[test]
+    fn gc_reclaims_stale_writer_lock_and_succeeds() {
+        let archive_path = test_path("axon-test-gc-lock-stale", "axon");
+        let source = test_path("axon-source", "txt");
+        init_empty_archive(&archive_path, false).expect("init should succeed");
+        std::fs::write(&source, b"payload").expect("write source");
+        add_file(&archive_path, "docs/a.txt", &source).expect("add");
+
+        let now = unix_now_millis().expect("now");
+        let stale = WriterLockRecord {
+            owner_pid: 7777,
+            acquired_at_ms: now.saturating_sub(10_000),
+            expires_at_ms: now.saturating_sub(1),
+        };
+        let lock_path = writer_lock_path(&archive_path);
+        std::fs::write(
+            &lock_path,
+            serde_json::to_vec(&stale).expect("serialize stale lock"),
+        )
+        .expect("write stale lock");
+
+        let report = gc_checkpoint(&archive_path).expect("gc should reclaim stale lock");
+        assert!(report.ok);
+        assert!(!lock_path.exists());
+        assert_eq!(
+            read_file(&archive_path, "docs/a.txt").expect("read"),
+            b"payload".to_vec()
+        );
+
+        std::fs::remove_file(archive_path).expect("cleanup");
+        std::fs::remove_file(source).expect("cleanup");
     }
 
     #[test]

@@ -21,7 +21,7 @@ Implemented in this baseline:
 - WAL persistence + status inspection (`axon wal --status`)
 - Atomic batch mutations with OCC checks (`axon batch`)
 - Structural archive verification prechecks (`axon verify`)
-- GC checkpoint compaction scaffold (`axon gc`)
+- GC checkpoint compaction with optional tombstone pruning (`axon gc`)
 - Per-file version history inspection (`axon log`)
 - Unit and CLI integration tests
 
@@ -42,6 +42,7 @@ cargo run -- list demo.axon --prefix src/ --limit 20
 cargo run -- wal demo.axon --status --pretty
 cargo run -- verify demo.axon --pretty
 cargo run -- gc demo.axon --pretty
+cargo run -- gc demo.axon --prune-tombstones --pretty
 cargo run -- batch demo.axon ./mutations.json --pretty
 cargo run -- info demo.axon --pretty
 cargo run -- peek demo.axon --pretty
@@ -62,8 +63,8 @@ bash ./run_cli_tests.sh
 - Mutations append WAL entries (`add`/`patch`/`remove`), with `wal --status` for inspection.
 - Read/query state is resolved as base manifest + WAL replay (single-writer semantics).
 - `batch` applies multiple mutations atomically with OCC expected-version checks.
-- `verify` performs pointer-bounds and decode prechecks for header/WAL/index/manifest regions.
-- `gc` checkpoints current reachable data into a fresh snapshot and folds WAL entries.
+- `verify` performs deep consistency checks across header/WAL/index/manifest/block references.
+- `gc` checkpoints current reachable data into a fresh snapshot, folds WAL entries, and can prune tombstoned manifest entries.
 - WAL and OCC are implemented for current single-writer semantics.
 - Sidecar lock-table writer coordination with TTL is implemented for mutating commands.
 - CLI failures now emit machine-readable JSON errors with stable symbolic codes and exit codes.
@@ -79,5 +80,5 @@ bash ./run_cli_tests.sh
 ## Next Implementation Milestones
 
 1. Add encryption and key-management flows.
-2. Harden lock coordination for broader multi-process scenarios.
-3. Expand observability (error contract docs, operation metrics, richer diagnostics).
+2. Expand observability (operation metrics, richer diagnostics).
+3. Add compatibility/fuzzing coverage for evolving format versions.

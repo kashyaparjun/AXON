@@ -1,8 +1,8 @@
 use axon::archive::{
-    add_file, apply_batch_mutations, gc_checkpoint, init_empty_archive, list_files,
+    add_file, apply_batch_mutations, gc_checkpoint_with_options, init_empty_archive, list_files,
     patch_file_with_expected_version, read_archive_info, read_file, read_file_history,
     read_file_version, read_root_manifest, remove_file_with_expected_version, search_files,
-    verify_archive, wal_status, BatchMutation,
+    verify_archive, wal_status, BatchMutation, GcOptions,
 };
 use axon::AxonError;
 use clap::{Parser, Subcommand};
@@ -99,6 +99,8 @@ enum Command {
     /// Compact archive snapshots and fold WAL into a fresh checkpoint.
     Gc {
         archive: PathBuf,
+        #[arg(long, default_value_t = false)]
+        prune_tombstones: bool,
         #[arg(long, default_value_t = false)]
         pretty: bool,
     },
@@ -329,8 +331,12 @@ fn run() -> axon::Result<()> {
             };
             println!("{output}");
         }
-        Command::Gc { archive, pretty } => {
-            let report = gc_checkpoint(&archive)?;
+        Command::Gc {
+            archive,
+            prune_tombstones,
+            pretty,
+        } => {
+            let report = gc_checkpoint_with_options(&archive, GcOptions { prune_tombstones })?;
             let output = if pretty {
                 serde_json::to_string_pretty(&report)?
             } else {
