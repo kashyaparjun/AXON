@@ -6,7 +6,7 @@ use axon::archive::{
 };
 use axon::AxonError;
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -90,7 +90,7 @@ enum Command {
         #[arg(long, default_value_t = false)]
         pretty: bool,
     },
-    /// Verify archive pointer bounds and structural decodability.
+    /// Verify archive integrity, including deep consistency checks.
     Verify {
         archive: PathBuf,
         #[arg(long, default_value_t = false)]
@@ -129,8 +129,8 @@ enum Command {
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("{err}");
-        std::process::exit(1);
+        emit_error_json(&err);
+        std::process::exit(exit_code_for_error(&err));
     }
 }
 
@@ -405,4 +405,62 @@ struct BatchMutationRequest {
     path: String,
     source: Option<PathBuf>,
     expected_version: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct CliErrorPayload<'a> {
+    ok: bool,
+    error: CliErrorBody<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct CliErrorBody<'a> {
+    code: &'a str,
+    exit_code: i32,
+    message: String,
+}
+
+fn emit_error_json(err: &axon::AxonError) {
+    let exit_code = exit_code_for_error(err);
+    let payload = CliErrorPayload {
+        ok: false,
+        error: CliErrorBody {
+            code: error_code_symbol(err),
+            exit_code,
+            message: err.to_string(),
+        },
+    };
+    let output = serde_json::to_string(&payload).unwrap_or_else(|_| {
+        format!(
+            "{{\"ok\":false,\"error\":{{\"code\":\"ERR_INTERNAL\",\"exit_code\":70,\"message\":\"{}\"}}}}",
+            err
+        )
+    });
+    eprintln!("{output}");
+}
+
+fn error_code_symbol(err: &axon::AxonError) -> &'static str {
+    match err {
+        AxonError::AlreadyExists(_) => "ERR_ALREADY_EXISTS",
+        AxonError::EntryExists(_) => "ERR_ENTRY_EXISTS",
+        AxonError::NotFound(_) => "ERR_NOT_FOUND",
+        AxonError::Conflict(_) => "ERR_CONFLICT",
+        AxonError::Unsupported(_) => "ERR_UNSUPPORTED",
+        AxonError::InvalidArchive(_) => "ERR_INVALID_ARCHIVE",
+        AxonError::Json(_) => "ERR_JSON",
+        AxonError::Io(_) => "ERR_IO",
+    }
+}
+
+fn exit_code_for_error(err: &axon::AxonError) -> i32 {
+    match err {
+        AxonError::AlreadyExists(_) => 21,
+        AxonError::EntryExists(_) => 22,
+        AxonError::NotFound(_) => 23,
+        AxonError::Conflict(_) => 24,
+        AxonError::Unsupported(_) => 25,
+        AxonError::InvalidArchive(_) => 26,
+        AxonError::Json(_) => 27,
+        AxonError::Io(_) => 28,
+    }
 }

@@ -15,5 +15,6 @@ bash "$ROOT_DIR/test_cli_log.sh"
 bash "$ROOT_DIR/test_cli_verify.sh"
 bash "$ROOT_DIR/test_cli_gc.sh"
 bash "$ROOT_DIR/test_cli_batch.sh"
+bash "$ROOT_DIR/test_cli_contract.sh"
 
 echo "PASS: all CLI bash tests"

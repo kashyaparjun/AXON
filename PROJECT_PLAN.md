@@ -23,8 +23,9 @@ Implemented:
 - WAL v1 binary codec and persisted mutation entries for add/patch/remove
 - WAL status inspection command (`wal --status`)
 - Atomic batch mutation command with OCC checks (`batch`)
-- `verify` command with pointer-bounds and decode prechecks
-- `gc` checkpoint scaffold that compacts WAL into fresh snapshots
+- `verify` command with deep consistency checks across manifest/WAL/index/block references
+- `gc` checkpoint compaction with reachable-block copy, orphan reclamation, and idempotence coverage
+- Lock table and multi-process writer locking with TTL renew/release semantics
 - Block format + block index format primitives
 - `add`, `read`, and `patch` for current-version file content
 - `remove` tombstone semantics with append-only snapshot commits
@@ -41,9 +42,8 @@ Implemented:
 - Top-level bash CLI tests with runner (`run_cli_tests.sh`) validating roundtrip, patch, remove, and failure paths
 
 Not implemented:
-- Lock table and multi-process writer locking
 - Encryption
-- Production-hardening for GC/checkpoint/compaction
+- Further production-hardening for lock coordination and compaction behavior
 
 ## 3. Delivery Phases
 

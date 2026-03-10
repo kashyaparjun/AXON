@@ -65,7 +65,9 @@ bash ./run_cli_tests.sh
 - `verify` performs pointer-bounds and decode prechecks for header/WAL/index/manifest regions.
 - `gc` checkpoints current reachable data into a fresh snapshot and folds WAL entries.
 - WAL and OCC are implemented for current single-writer semantics.
-- Lock-table coordination and encryption are not implemented yet.
+- Sidecar lock-table writer coordination with TTL is implemented for mutating commands.
+- CLI failures now emit machine-readable JSON errors with stable symbolic codes and exit codes.
+- Encryption is not implemented yet.
 - Delta blocks are implemented for patch/read flows with deterministic BASE/DELTA selection and depth caps.
 - Versioned reads and per-file history logs are implemented (`read --version`, `log`).
 - Current write path is append-only with snapshot updates for block index + root manifest, followed by header update.
@@ -76,6 +78,6 @@ bash ./run_cli_tests.sh
 
 ## Next Implementation Milestones
 
-1. Add lock-table backed multi-process writer coordination.
-2. Expand integrity verification beyond pointer/decode prechecks to deep consistency scans.
-3. Implement production-safe compaction/orphan reclamation.
+1. Add encryption and key-management flows.
+2. Harden lock coordination for broader multi-process scenarios.
+3. Expand observability (error contract docs, operation metrics, richer diagnostics).

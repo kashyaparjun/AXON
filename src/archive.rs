@@ -10,15 +10,18 @@ use crate::format::manifest::{
 use crate::format::wal::{decode_wal, encode_wal, WalEntry, OP_ADD, OP_PATCH, OP_REMOVE};
 use crate::manifest::{FileEntry, RootManifest, ShardDescriptor, ShardManifest};
 use crate::{AxonError, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SHARD_BUCKET_COUNT: u32 = 16;
 const SHARD_SPLIT_MIN_FILES: usize = 8;
 const MAX_DELTA_DEPTH: u8 = 8;
 const MAX_RECONSTRUCT_DEPTH: usize = 64;
+const WRITER_LOCK_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Serialize)]
 pub struct ArchiveInfo {
@@ -118,6 +121,7 @@ pub fn init_empty_archive(path: &Path, force: bool) -> Result<()> {
 }
 
 pub fn add_file(archive_path: &Path, archive_file_path: &str, source: &Path) -> Result<()> {
+    let writer_lock = acquire_writer_lock(archive_path)?;
     let mut header = read_header(archive_path)?;
     let mut wal_entries = read_wal_entries(archive_path, &header)?;
     let root_manifest = read_root_manifest(archive_path)?;
@@ -163,6 +167,7 @@ pub fn add_file(archive_path: &Path, archive_file_path: &str, source: &Path) -> 
         tombstoned: false,
     });
     files.sort_by(|a, b| a.path.cmp(&b.path));
+    writer_lock.renew()?;
 
     commit_snapshots(
         &mut file,
@@ -186,6 +191,7 @@ pub fn patch_file_with_expected_version(
     source: &Path,
     expected_version: Option<u32>,
 ) -> Result<()> {
+    let writer_lock = acquire_writer_lock(archive_path)?;
     let mut header = read_header(archive_path)?;
     let mut wal_entries = read_wal_entries(archive_path, &header)?;
     let root_manifest = read_root_manifest(archive_path)?;
@@ -227,6 +233,7 @@ pub fn patch_file_with_expected_version(
         algo: new_block.header.algo,
         tombstoned: false,
     });
+    writer_lock.renew()?;
 
     commit_snapshots(
         &mut file,
@@ -249,6 +256,7 @@ pub fn remove_file_with_expected_version(
     archive_file_path: &str,
     expected_version: Option<u32>,
 ) -> Result<()> {
+    let writer_lock = acquire_writer_lock(archive_path)?;
     let mut header = read_header(archive_path)?;
     let mut wal_entries = read_wal_entries(archive_path, &header)?;
     let root_manifest = read_root_manifest(archive_path)?;
@@ -277,6 +285,7 @@ pub fn remove_file_with_expected_version(
         algo: file_entry.algo,
         tombstoned: true,
     });
+    writer_lock.renew()?;
 
     let mut file = OpenOptions::new()
         .read(true)
@@ -417,81 +426,177 @@ pub fn verify_archive(path: &Path) -> Result<VerifyReport> {
 
     let wal_entries = read_wal_entries(path, &header)?;
     let manifest = read_root_manifest(path)?;
+    for descriptor in &manifest.shard_descriptors {
+        validate_region_bounds(
+            descriptor.shard_offset,
+            u64::from(descriptor.shard_size),
+            file_size,
+            "shard manifest out of bounds",
+        )?;
+    }
+
     let index = read_block_index(path, &header)?;
+    let mut index_map: HashMap<[u8; 32], BlockIndexEntry> = HashMap::with_capacity(index.len());
     for entry in &index {
+        if index_map.insert(entry.block_id, entry.clone()).is_some() {
+            return Err(AxonError::InvalidArchive("duplicate block id in index"));
+        }
         let total = u64::from(entry.stored_size)
             .checked_add(BLOCK_HEADER_SIZE as u64)
             .ok_or(AxonError::InvalidArchive("block region overflow"))?;
         validate_region_bounds(entry.offset, total, file_size, "block entry out of bounds")?;
+        let block = read_stored_block_at(path, entry.offset, entry.stored_size)?;
+        if block.header.block_id != entry.block_id {
+            return Err(AxonError::InvalidArchive("block id mismatch"));
+        }
+        if block.header.stored_size != entry.stored_size {
+            return Err(AxonError::InvalidArchive("block stored size mismatch"));
+        }
+    }
+
+    let mut files = manifest.files.clone();
+    for descriptor in &manifest.shard_descriptors {
+        let shard = read_shard_manifest(path, descriptor)?;
+        files.extend(shard.files);
+    }
+    if manifest.total_file_count != files.len() as u64 {
+        return Err(AxonError::InvalidArchive(
+            "manifest total_file_count does not match file entries",
+        ));
+    }
+
+    let mut seen_paths = HashSet::new();
+    for file in &files {
+        if !seen_paths.insert(file.path.as_str()) {
+            return Err(AxonError::InvalidArchive("duplicate file path in manifest"));
+        }
+    }
+
+    apply_wal_entries(&mut files, &wal_entries)?;
+    if header.total_files != files.len() as u64 {
+        return Err(AxonError::InvalidArchive(
+            "header total_files does not match manifest state",
+        ));
+    }
+
+    let mut referenced_block_ids: HashSet<[u8; 32]> = HashSet::new();
+    for file in &files {
+        verify_file_block_references(path, &index, &index_map, file, &mut referenced_block_ids)?;
+    }
+    for entry in &wal_entries {
+        let block = index_map
+            .get(&entry.block_id)
+            .ok_or(AxonError::InvalidArchive("WAL references missing block"))?;
+        if block.stored_size != entry.stored_size {
+            return Err(AxonError::InvalidArchive("WAL block stored size mismatch"));
+        }
+        referenced_block_ids.insert(entry.block_id);
+    }
+    for block_id in index_map.keys() {
+        if !referenced_block_ids.contains(block_id) {
+            return Err(AxonError::InvalidArchive("orphaned block in index"));
+        }
     }
 
     Ok(VerifyReport {
         ok: true,
         file_size,
-        total_files: manifest.total_file_count,
+        total_files: files.len() as u64,
         block_index_count: header.block_index_count,
         wal_entry_count: wal_entries.len(),
     })
 }
 
 pub fn gc_checkpoint(path: &Path) -> Result<GcReport> {
-    let old_size = std::fs::metadata(path)?.len();
-    let header = read_header(path)?;
-    let root = read_root_manifest(path)?;
-    let files = load_manifest_files(path)?;
-    let old_index = read_block_index(path, &header)?;
-    let wal_entries = read_wal_entries(path, &header)?;
-
+    let writer_lock = acquire_writer_lock(path)?;
     let tmp = path.with_extension("axon.gc.tmp");
-    let mut out = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .read(true)
-        .write(true)
-        .open(&tmp)?;
-
-    let mut new_header = header.clone();
-    out.write_all(&new_header.encode())?;
-    let mut end = HEADER_SIZE as u64;
-    let mut new_index = Vec::with_capacity(old_index.len());
-    for entry in &old_index {
-        let block = read_stored_block_at(path, entry.offset, entry.stored_size)?;
-        out.seek(SeekFrom::Start(end))?;
-        out.write_all(&block.encode())?;
-        new_index.push(BlockIndexEntry {
-            block_id: entry.block_id,
-            offset: end,
-            stored_size: entry.stored_size,
-        });
-        end += block.encoded_len();
+    if tmp.exists() {
+        std::fs::remove_file(&tmp)?;
     }
 
-    commit_snapshots(
-        &mut out,
-        &mut new_header,
-        root.format_flags,
-        &files,
-        &[],
-        &new_index,
-        end,
-    )?;
-    drop(out);
+    let result = (|| -> Result<GcReport> {
+        let old_size = std::fs::metadata(path)?.len();
+        let header = read_header(path)?;
+        let root = read_root_manifest(path)?;
+        let files = load_manifest_files(path)?;
+        let old_index = read_block_index(path, &header)?;
+        let wal_entries = read_wal_entries(path, &header)?;
 
-    let new_size = std::fs::metadata(&tmp)?.len();
-    std::fs::rename(&tmp, path)?;
-    Ok(GcReport {
-        ok: true,
-        old_size,
-        new_size,
-        blocks_copied: new_index.len(),
-        wal_entries_compacted: wal_entries.len(),
-    })
+        let mut index_map: HashMap<[u8; 32], BlockIndexEntry> =
+            HashMap::with_capacity(old_index.len());
+        for entry in &old_index {
+            if index_map.insert(entry.block_id, entry.clone()).is_some() {
+                return Err(AxonError::InvalidArchive("duplicate block id in index"));
+            }
+        }
+
+        let reachable_ids = collect_reachable_block_ids(path, &index_map, &files, &wal_entries)?;
+        let mut new_index = Vec::with_capacity(reachable_ids.len());
+
+        let mut out = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&tmp)?;
+
+        let mut new_header = header.clone();
+        out.write_all(&new_header.encode())?;
+        let mut end = HEADER_SIZE as u64;
+        for entry in &old_index {
+            if !reachable_ids.contains(&entry.block_id) {
+                continue;
+            }
+            writer_lock.renew()?;
+            let block = read_stored_block_at(path, entry.offset, entry.stored_size)?;
+            out.seek(SeekFrom::Start(end))?;
+            out.write_all(&block.encode())?;
+            new_index.push(BlockIndexEntry {
+                block_id: entry.block_id,
+                offset: end,
+                stored_size: entry.stored_size,
+            });
+            end += block.encoded_len();
+        }
+        if new_index.len() != reachable_ids.len() {
+            return Err(AxonError::InvalidArchive(
+                "reachable block set does not match copied index",
+            ));
+        }
+
+        commit_snapshots(
+            &mut out,
+            &mut new_header,
+            root.format_flags,
+            &files,
+            &[],
+            &new_index,
+            end,
+        )?;
+        drop(out);
+
+        let new_size = std::fs::metadata(&tmp)?.len();
+        std::fs::rename(&tmp, path)?;
+        Ok(GcReport {
+            ok: true,
+            old_size,
+            new_size,
+            blocks_copied: new_index.len(),
+            wal_entries_compacted: wal_entries.len(),
+        })
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 pub fn apply_batch_mutations(archive_path: &Path, mutations: &[BatchMutation]) -> Result<usize> {
     if mutations.is_empty() {
         return Ok(0);
     }
+    let writer_lock = acquire_writer_lock(archive_path)?;
 
     enum PreparedMutation {
         Add {
@@ -652,8 +757,10 @@ pub fn apply_batch_mutations(archive_path: &Path, mutations: &[BatchMutation]) -
         .open(archive_path)?;
     let mut end = file.seek(SeekFrom::End(0))?;
     for block in &blocks_to_append {
+        writer_lock.renew()?;
         append_block_if_missing(&mut file, &mut end, &mut index, block)?;
     }
+    writer_lock.renew()?;
 
     commit_snapshots(
         &mut file,
@@ -919,6 +1026,217 @@ fn apply_wal_entries(files: &mut Vec<FileEntry>, entries: &[WalEntry]) -> Result
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(())
+}
+
+fn verify_file_block_references(
+    path: &Path,
+    index: &[BlockIndexEntry],
+    index_map: &HashMap<[u8; 32], BlockIndexEntry>,
+    file: &FileEntry,
+    referenced_block_ids: &mut HashSet<[u8; 32]>,
+) -> Result<()> {
+    if file.version == 0 {
+        return Err(AxonError::InvalidArchive("file version must be >= 1"));
+    }
+    if file.history_block_ids.len() + 1 != file.version as usize {
+        return Err(AxonError::InvalidArchive(
+            "file version does not match history length",
+        ));
+    }
+
+    let current_id = hex_decode_32(&file.block_id_hex)?;
+    verify_manifest_block_reference(path, index, index_map, current_id, file, true)?;
+    referenced_block_ids.insert(current_id);
+
+    for block_id_hex in &file.history_block_ids {
+        let block_id = hex_decode_32(block_id_hex)?;
+        verify_manifest_block_reference(path, index, index_map, block_id, file, false)?;
+        referenced_block_ids.insert(block_id);
+    }
+    Ok(())
+}
+
+fn verify_manifest_block_reference(
+    path: &Path,
+    index: &[BlockIndexEntry],
+    index_map: &HashMap<[u8; 32], BlockIndexEntry>,
+    block_id: [u8; 32],
+    file: &FileEntry,
+    is_current: bool,
+) -> Result<()> {
+    let index_entry = index_map.get(&block_id).ok_or(AxonError::InvalidArchive(
+        "manifest references missing block",
+    ))?;
+    let block = read_stored_block_at(path, index_entry.offset, index_entry.stored_size)?;
+    if block.header.block_id != block_id {
+        return Err(AxonError::InvalidArchive("block id mismatch"));
+    }
+    if is_current {
+        if block.header.raw_size != file.raw_size {
+            return Err(AxonError::InvalidArchive("manifest raw size mismatch"));
+        }
+        if block.header.stored_size != file.stored_size {
+            return Err(AxonError::InvalidArchive("manifest stored size mismatch"));
+        }
+        if block.header.algo != file.algo {
+            return Err(AxonError::InvalidArchive("manifest algo mismatch"));
+        }
+    }
+    let _ = resolve_block_raw_by_id(path, index, &block_id, MAX_RECONSTRUCT_DEPTH)
+        .map_err(|_| AxonError::InvalidArchive("failed to reconstruct referenced block"))?;
+    Ok(())
+}
+
+fn collect_reachable_block_ids(
+    path: &Path,
+    index_map: &HashMap<[u8; 32], BlockIndexEntry>,
+    files: &[FileEntry],
+    wal_entries: &[WalEntry],
+) -> Result<HashSet<[u8; 32]>> {
+    let mut stack = Vec::new();
+    for file in files {
+        stack.push(hex_decode_32(&file.block_id_hex)?);
+        for block_id_hex in &file.history_block_ids {
+            stack.push(hex_decode_32(block_id_hex)?);
+        }
+    }
+    for entry in wal_entries {
+        stack.push(entry.block_id);
+    }
+
+    let mut reachable = HashSet::new();
+    while let Some(block_id) = stack.pop() {
+        if !reachable.insert(block_id) {
+            continue;
+        }
+        let index_entry = index_map.get(&block_id).ok_or(AxonError::InvalidArchive(
+            "reachable block missing from index",
+        ))?;
+        let block = read_stored_block_at(path, index_entry.offset, index_entry.stored_size)?;
+        if block.header.block_id != block_id {
+            return Err(AxonError::InvalidArchive("block id mismatch"));
+        }
+        match block.header.block_type {
+            BLOCK_TYPE_BASE => {}
+            BLOCK_TYPE_DELTA => {
+                if block.header.base_id == [0; 32] {
+                    return Err(AxonError::InvalidArchive("delta block missing base id"));
+                }
+                stack.push(block.header.base_id);
+            }
+            _ => return Err(AxonError::Unsupported("unsupported block type")),
+        }
+    }
+
+    Ok(reachable)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WriterLockRecord {
+    owner_pid: u32,
+    acquired_at_ms: u64,
+    expires_at_ms: u64,
+}
+
+struct WriterLockGuard {
+    lock_path: PathBuf,
+    owner_pid: u32,
+}
+
+impl WriterLockGuard {
+    fn renew(&self) -> Result<()> {
+        let now = unix_now_millis()?;
+        let mut current = read_writer_lock_record(&self.lock_path)?;
+        if current.owner_pid != self.owner_pid {
+            return Err(AxonError::Conflict("writer lock owner changed".to_string()));
+        }
+        current.expires_at_ms = now + WRITER_LOCK_TTL.as_millis() as u64;
+        write_writer_lock_record(&self.lock_path, &current)
+    }
+}
+
+impl Drop for WriterLockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
+
+fn acquire_writer_lock(archive_path: &Path) -> Result<WriterLockGuard> {
+    let lock_path = writer_lock_path(archive_path);
+    let now = unix_now_millis()?;
+    let lock = WriterLockRecord {
+        owner_pid: std::process::id(),
+        acquired_at_ms: now,
+        expires_at_ms: now + WRITER_LOCK_TTL.as_millis() as u64,
+    };
+    let lock_bytes = serde_json::to_vec(&lock)?;
+
+    for _ in 0..3 {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                file.write_all(&lock_bytes)?;
+                file.flush()?;
+                return Ok(WriterLockGuard {
+                    lock_path,
+                    owner_pid: lock.owner_pid,
+                });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let current = match read_writer_lock_record(&lock_path) {
+                    Ok(value) => value,
+                    Err(AxonError::Io(io_err)) if io_err.kind() == std::io::ErrorKind::NotFound => {
+                        continue;
+                    }
+                    Err(_) => {
+                        let _ = std::fs::remove_file(&lock_path);
+                        continue;
+                    }
+                };
+                let now = unix_now_millis()?;
+                if current.expires_at_ms <= now {
+                    let _ = std::fs::remove_file(&lock_path);
+                    continue;
+                }
+                return Err(AxonError::Conflict(format!(
+                    "archive is locked by pid {}",
+                    current.owner_pid
+                )));
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Err(AxonError::Conflict(
+        "failed to acquire writer lock".to_string(),
+    ))
+}
+
+fn writer_lock_path(archive_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.lock", archive_path.display()))
+}
+
+fn read_writer_lock_record(path: &Path) -> Result<WriterLockRecord> {
+    let bytes = std::fs::read(path)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn write_writer_lock_record(path: &Path, record: &WriterLockRecord) -> Result<()> {
+    let bytes = serde_json::to_vec(record)?;
+    let mut file = OpenOptions::new().write(true).truncate(true).open(path)?;
+    file.write_all(&bytes)?;
+    file.flush()?;
+    Ok(())
+}
+
+fn unix_now_millis() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| AxonError::InvalidArchive("system clock before unix epoch"))?
+        .as_millis() as u64)
 }
 
 fn validate_region_bounds(
@@ -1228,6 +1546,79 @@ mod tests {
 
         std::fs::remove_file(archive_path).expect("cleanup");
         std::fs::remove_file(source_path).expect("cleanup");
+    }
+
+    #[test]
+    fn writer_lock_blocks_concurrent_writer_attempts() {
+        let archive_path = test_path("axon-test-lock-conflict", "axon");
+        let source = test_path("axon-source", "txt");
+        init_empty_archive(&archive_path, false).expect("init should succeed");
+        std::fs::write(&source, b"payload").expect("write source");
+
+        let now = unix_now_millis().expect("now");
+        let lock = WriterLockRecord {
+            owner_pid: 4242,
+            acquired_at_ms: now,
+            expires_at_ms: now + WRITER_LOCK_TTL.as_millis() as u64,
+        };
+        let lock_path = writer_lock_path(&archive_path);
+        std::fs::write(
+            &lock_path,
+            serde_json::to_vec(&lock).expect("serialize lock"),
+        )
+        .expect("write lock");
+
+        let err = add_file(&archive_path, "docs/a.txt", &source).expect_err("lock should block");
+        assert!(matches!(err, AxonError::Conflict(_)));
+
+        std::fs::remove_file(lock_path).expect("cleanup lock");
+        std::fs::remove_file(archive_path).expect("cleanup");
+        std::fs::remove_file(source).expect("cleanup");
+    }
+
+    #[test]
+    fn writer_lock_stale_entry_is_recovered() {
+        let archive_path = test_path("axon-test-lock-stale", "axon");
+        let source = test_path("axon-source", "txt");
+        init_empty_archive(&archive_path, false).expect("init should succeed");
+        std::fs::write(&source, b"payload").expect("write source");
+
+        let now = unix_now_millis().expect("now");
+        let stale = WriterLockRecord {
+            owner_pid: 1111,
+            acquired_at_ms: now.saturating_sub(10_000),
+            expires_at_ms: now.saturating_sub(1),
+        };
+        let lock_path = writer_lock_path(&archive_path);
+        std::fs::write(
+            &lock_path,
+            serde_json::to_vec(&stale).expect("serialize stale lock"),
+        )
+        .expect("write stale lock");
+
+        add_file(&archive_path, "docs/a.txt", &source).expect("stale lock should be reclaimed");
+        assert!(!lock_path.exists());
+
+        std::fs::remove_file(archive_path).expect("cleanup");
+        std::fs::remove_file(source).expect("cleanup");
+    }
+
+    #[test]
+    fn writer_lock_is_released_after_failed_mutation() {
+        let archive_path = test_path("axon-test-lock-release-on-error", "axon");
+        let source = test_path("axon-source", "txt");
+        init_empty_archive(&archive_path, false).expect("init should succeed");
+        std::fs::write(&source, b"payload").expect("write source");
+        add_file(&archive_path, "docs/a.txt", &source).expect("seed add");
+
+        let lock_path = writer_lock_path(&archive_path);
+        let err =
+            add_file(&archive_path, "docs/a.txt", &source).expect_err("duplicate should fail");
+        assert!(matches!(err, AxonError::EntryExists(_)));
+        assert!(!lock_path.exists());
+
+        std::fs::remove_file(archive_path).expect("cleanup");
+        std::fs::remove_file(source).expect("cleanup");
     }
 
     #[test]
@@ -1858,6 +2249,65 @@ mod tests {
     }
 
     #[test]
+    fn verify_detects_manifest_references_missing_block() {
+        let archive_path = test_path("axon-test-verify-missing-block", "axon");
+        let source = test_path("axon-source", "txt");
+        init_empty_archive(&archive_path, false).expect("init should succeed");
+        std::fs::write(&source, b"payload").expect("write source");
+        add_file(&archive_path, "docs/a.txt", &source).expect("add");
+
+        rewrite_header(&archive_path, |header| {
+            header.block_index_count = 0;
+        });
+
+        let err = verify_archive(&archive_path).expect_err("verify should fail");
+        assert!(matches!(err, AxonError::InvalidArchive(_)));
+
+        std::fs::remove_file(archive_path).expect("cleanup");
+        std::fs::remove_file(source).expect("cleanup");
+    }
+
+    #[test]
+    fn verify_detects_orphaned_blocks() {
+        let archive_path = test_path("axon-test-verify-orphan", "axon");
+        let a = test_path("axon-source", "txt");
+        let b = test_path("axon-source", "txt");
+        init_empty_archive(&archive_path, false).expect("init should succeed");
+        std::fs::write(&a, b"a").expect("write source");
+        std::fs::write(&b, b"b").expect("write source");
+        add_file(&archive_path, "docs/a.txt", &a).expect("add a");
+        add_file(&archive_path, "docs/b.txt", &b).expect("add b");
+
+        let mut root = read_root_manifest(&archive_path).expect("root");
+        root.files.retain(|entry| entry.path == "docs/a.txt");
+        root.total_file_count = root.files.len() as u64;
+        let root_bytes = encode_root_manifest(&root).expect("encode root");
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&archive_path)
+            .expect("open archive");
+        let root_offset = file.seek(SeekFrom::End(0)).expect("seek");
+        file.write_all(&root_bytes).expect("write root");
+        file.flush().expect("flush root");
+
+        rewrite_header(&archive_path, |header| {
+            header.root_manifest_offset = root_offset;
+            header.root_manifest_size = u32::try_from(root_bytes.len()).expect("u32 size");
+            header.total_files = 1;
+            header.wal_size = 0;
+        });
+
+        let err = verify_archive(&archive_path).expect_err("verify should fail");
+        assert!(matches!(err, AxonError::InvalidArchive(_)));
+
+        std::fs::remove_file(archive_path).expect("cleanup");
+        std::fs::remove_file(a).expect("cleanup");
+        std::fs::remove_file(b).expect("cleanup");
+    }
+
+    #[test]
     fn gc_checkpoint_compacts_wal_and_preserves_reads() {
         let archive_path = test_path("axon-test-gc", "axon");
         let a = test_path("axon-source", "txt");
@@ -1885,6 +2335,123 @@ mod tests {
         std::fs::remove_file(archive_path).expect("cleanup");
         std::fs::remove_file(a).expect("cleanup");
         std::fs::remove_file(b).expect("cleanup");
+    }
+
+    #[test]
+    fn gc_reclaims_orphaned_blocks_from_index() {
+        let archive_path = test_path("axon-test-gc-reclaim", "axon");
+        let a = test_path("axon-source", "txt");
+        let b = test_path("axon-source", "txt");
+        init_empty_archive(&archive_path, false).expect("init should succeed");
+        std::fs::write(&a, b"a").expect("write source");
+        std::fs::write(&b, b"b").expect("write source");
+        add_file(&archive_path, "docs/a.txt", &a).expect("add a");
+        add_file(&archive_path, "docs/b.txt", &b).expect("add b");
+
+        let mut root = read_root_manifest(&archive_path).expect("root");
+        root.files.retain(|entry| entry.path == "docs/a.txt");
+        root.total_file_count = 1;
+        let root_bytes = encode_root_manifest(&root).expect("encode root");
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&archive_path)
+            .expect("open archive");
+        let root_offset = file.seek(SeekFrom::End(0)).expect("seek");
+        file.write_all(&root_bytes).expect("write root");
+        file.flush().expect("flush root");
+
+        rewrite_header(&archive_path, |header| {
+            header.root_manifest_offset = root_offset;
+            header.root_manifest_size = u32::try_from(root_bytes.len()).expect("u32 size");
+            header.total_files = 1;
+            header.wal_size = 0;
+        });
+
+        let report = gc_checkpoint(&archive_path).expect("gc");
+        assert!(report.ok);
+        assert_eq!(report.blocks_copied, 1);
+        assert_eq!(
+            read_file(&archive_path, "docs/a.txt").expect("read a"),
+            b"a"
+        );
+        let err = read_file(&archive_path, "docs/b.txt").expect_err("read b should fail");
+        assert!(matches!(err, AxonError::NotFound(_)));
+
+        std::fs::remove_file(archive_path).expect("cleanup");
+        std::fs::remove_file(a).expect("cleanup");
+        std::fs::remove_file(b).expect("cleanup");
+    }
+
+    #[test]
+    fn gc_checkpoint_is_idempotent() {
+        let archive_path = test_path("axon-test-gc-idempotent", "axon");
+        let a = test_path("axon-source", "txt");
+        let b = test_path("axon-source", "txt");
+        init_empty_archive(&archive_path, false).expect("init should succeed");
+        std::fs::write(&a, b"alpha").expect("write source");
+        std::fs::write(&b, b"beta").expect("write source");
+        add_file(&archive_path, "docs/a.txt", &a).expect("add");
+        patch_file(&archive_path, "docs/a.txt", &b).expect("patch");
+
+        let first = gc_checkpoint(&archive_path).expect("first gc");
+        assert!(first.ok);
+        let bytes_after_first = std::fs::read(&archive_path).expect("read after first gc");
+
+        let second = gc_checkpoint(&archive_path).expect("second gc");
+        assert!(second.ok);
+        assert_eq!(second.wal_entries_compacted, 0);
+        assert_eq!(first.blocks_copied, second.blocks_copied);
+
+        let bytes_after_second = std::fs::read(&archive_path).expect("read after second gc");
+        assert_eq!(bytes_after_first, bytes_after_second);
+        assert_eq!(
+            read_file(&archive_path, "docs/a.txt").expect("read"),
+            b"beta".to_vec()
+        );
+
+        std::fs::remove_file(archive_path).expect("cleanup");
+        std::fs::remove_file(a).expect("cleanup");
+        std::fs::remove_file(b).expect("cleanup");
+    }
+
+    #[test]
+    fn gc_failure_cleans_up_tmp_and_keeps_archive_readable() {
+        let archive_path = test_path("axon-test-gc-failure-cleanup", "axon");
+        let source = test_path("axon-source", "txt");
+        init_empty_archive(&archive_path, false).expect("init should succeed");
+        std::fs::write(&source, b"payload").expect("write source");
+        add_file(&archive_path, "docs/a.txt", &source).expect("add");
+
+        let mut root = read_root_manifest(&archive_path).expect("root");
+        root.files[0].block_id_hex = "00".repeat(32);
+        let root_bytes = encode_root_manifest(&root).expect("encode root");
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&archive_path)
+            .expect("open archive");
+        let root_offset = file.seek(SeekFrom::End(0)).expect("seek");
+        file.write_all(&root_bytes).expect("write root");
+        file.flush().expect("flush root");
+
+        rewrite_header(&archive_path, |header| {
+            header.root_manifest_offset = root_offset;
+            header.root_manifest_size = u32::try_from(root_bytes.len()).expect("u32 size");
+        });
+
+        let tmp = archive_path.with_extension("axon.gc.tmp");
+        let err = gc_checkpoint(&archive_path).expect_err("gc should fail");
+        assert!(matches!(
+            err,
+            AxonError::Io(_) | AxonError::InvalidArchive(_)
+        ));
+        assert!(!tmp.exists());
+        assert!(archive_path.exists());
+
+        std::fs::remove_file(archive_path).expect("cleanup");
+        std::fs::remove_file(source).expect("cleanup");
     }
 
     #[test]
